@@ -3,7 +3,7 @@
 **Technical Configuration Guide**
 
 **Platform:** OpenWrt (LuCI / Firewall4 / DSA)  
-**Target hardware:** NETGEAR Orbi RBR750  
+**Target hardware:** NETGEAR Orbi RBR750  (this should work on any openwrt device, this is just what I used)  
 **Configuration type:** VLAN-based network segmentation  
 **Primary objective:** Provide guest devices with unrestricted internet access while preventing unauthorized access to the trusted home network, router administration, and other guest devices.
 

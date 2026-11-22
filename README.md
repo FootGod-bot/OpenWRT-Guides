@@ -614,27 +614,24 @@ nft list ruleset
 These commands are useful for diagnosing problems with firewall4.
 14. Final security checklist
 Before putting the network into use, make sure everything below is configured.
-Configuration progress
-0/16
 
 
-
-[ ] Guest network uses a separate subnet (192.168.50.0/24).
-[ ] Guest interface has its own DHCP server.
-[ ] Guest IPv6 is disabled or separately protected.
-[ ] Guest firewall zone has Input: REJECT.
-[ ] Guest firewall zone has Output: ACCEPT.
-[ ] Guest firewall zone has Forward: REJECT.
-[ ] Guest-to-WAN forwarding is enabled.
-[ ] Guest-to-LAN forwarding is NOT enabled.
-[ ] Guest-to-IoT forwarding is NOT enabled.
-[ ] Only DHCP and DNS are allowed to the router.
-[ ] Guest wireless client isolation is enabled.
-[ ] Guest Wi-Fi uses WPA2 or WPA3 security.
-[ ] Authorized devices have reserved IP addresses.
-[ ] Pass-through rules specify source device, destination device, protocol and port.
-[ ] Destination devices have appropriate local firewall rules.
-[ ] Internet, isolation and authorized access tests have passed.
+- Guest network uses a separate subnet (192.168.50.0/24).
+- Guest interface has its own DHCP server.
+- Guest IPv6 is disabled or separately protected.
+- Guest firewall zone has Input: REJECT.
+- Guest firewall zone has Output: ACCEPT.
+- Guest firewall zone has Forward: REJECT.
+- Guest-to-WAN forwarding is enabled.
+- Guest-to-LAN forwarding is NOT enabled.
+- Guest-to-IoT forwarding is NOT enabled.
+- Only DHCP and DNS are allowed to the router.
+- Guest wireless client isolation is enabled.
+- Guest Wi-Fi uses WPA2 or WPA3 security.
+- Authorized devices have reserved IP addresses.
+- Pass-through rules specify source device, destination device, protocol and port.
+- Destination devices have appropriate local firewall rules.
+- Internet, isolation and authorized access tests have passed.
 Reset checklist
 15. Official documentation
 These are useful references for understanding and maintaining the configuration:

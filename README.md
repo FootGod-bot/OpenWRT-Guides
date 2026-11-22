@@ -1,649 +1,718 @@
-OpenWrt: Secure Guest Wi-Fi Network & Selective LAN Access
+# OpenWrt: Secure Guest Wi-Fi Network & Selective LAN Access
 
-Security-focused configuration guide
- Modern OpenWrt / LuCI
+**Purpose:** Create an isolated guest wireless network that can access
+the internet but cannot access the router's administration services, the
+main LAN, or other guest clients. Then create narrowly scoped exceptions
+for approved devices and services.
 
-Objective: Create an isolated guest wireless network that can access the internet but cannot access your main network, router administration interfaces, or other guest devices. Then configure specific exceptions that allow authorized devices to communicate with selected devices on your main LAN using only explicitly permitted ports.
+> **Security model:** Default deny, explicit authorization, minimum
+> necessary access.
 
-This guide is based on the tutorial you provided, but expands it with modern OpenWrt networking, firewall configuration, device authorization, and selective traffic forwarding.
-1. Network design
-Before configuring anything, it's important to understand how the networks will be separated.
+This guide uses modern OpenWrt concepts, including firewall4/nftables
+and DSA networking. LuCI labels can vary slightly by OpenWrt version and
+device.
 
-We'll use the following example configuration:
-Network topology
-Internet
+------------------------------------------------------------------------
 
-External network access
+## Table of contents
 
-OpenWrt Router
+1.  [Network design](#1-network-design)
+2.  [Back up your configuration](#2-back-up-your-configuration)
+3.  [Create the guest interface](#3-create-the-guest-interface)
+4.  [Configure DHCP and IPv6](#4-configure-dhcp-and-ipv6)
+5.  [Create the guest firewall zone](#5-create-the-guest-firewall-zone)
+6.  [Allow DHCP and DNS to the
+    router](#6-allow-dhcp-and-dns-to-the-router)
+7.  [Create the guest wireless
+    network](#7-create-the-guest-wireless-network)
+8.  [Configure authorized-device
+    pass-through](#8-configure-authorized-device-pass-through)
+9.  [Manage multiple authorized devices and
+    services](#9-manage-multiple-authorized-devices-and-services)
+10. [Optional: Guest VLAN for wired
+    devices](#10-optional-guest-vlan-for-wired-devices)
+11. [Test the configuration](#11-test-the-configuration)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Final security checklist](#13-final-security-checklist)
 
-Firewall, routing, DHCP and DNS
+------------------------------------------------------------------------
 
+## 1. Network design
 
-Main LAN
-Trusted
-192.168.1.0/24
-BIGWAKE
+Use separate IP subnets for trusted and guest devices. The guest
+wireless network must attach to its own logical interface, not to the
+existing LAN bridge.
 
-- Computers
-- Servers
-- Home devices
-- Network storage
+### Example topology
 
+``` text
+                         INTERNET
+                            |
+                         OpenWrt
+                      /           \
+                 Main LAN       Guest LAN
+               192.168.1.0/24 192.168.50.0/24
+                    |               |
+             Trusted devices    Guest Wi-Fi
+             Servers, PCs       Visitors, guests
+                    |               |
+                    |         Default-deny policy
+                    |               |
+                    +----< approved, specific
+                           device/port rules only
+```
 
-Guest LAN
-Restricted
-192.168.50.0/24
-BIGWAKE-GUEST
+### Addressing plan
 
-- Guest phones
-- Visitors
-- Temporary devices
-- Authorized exceptions
+  Setting                 Main LAN                      Guest LAN
+  ----------------------- ----------------------------- ------------------------
+  Network                 `192.168.1.0/24`              `192.168.50.0/24`
+  Router address          `192.168.1.1`                 `192.168.50.1`
+  DHCP                    Enabled                       Enabled
+  Internet                Allowed                       Allowed
+  Router administration   Allowed for trusted devices   Blocked
+  Access to main LAN      Normal trusted policy         Blocked by default
+  Guest-to-guest          Not applicable                Blocked at Wi-Fi layer
 
+The guest network will have its own interface, DHCP service, firewall
+zone, and SSID.
 
+### Firewall policy overview
 
-Selective access
-Only explicitly authorized connections can reach specified LAN devices and ports.
+  -----------------------------------------------------------------------
+  Traffic                             Policy
+  ----------------------------------- -----------------------------------
+  Guest → WAN                         Allow
 
+  Guest → router                      Reject, except DHCP and DNS
 
+  Guest → main LAN                    Reject by default
 
-Network configuration
-Setting	Main LAN	Guest LAN
-Network	192.168.1.0/24	192.168.50.0/24
-Router IP	192.168.1.1	192.168.50.1
-DHCP	Enabled	Enabled
-Internet	Allowed	Allowed
-Router administration	Allowed	Blocked
-Main LAN access	Allowed	Blocked by default
-Guest client communication	N/A	Blocked
+  Guest → IoT or other internal zones Reject by default
 
-The guest network will have its own IP subnet, DHCP server, firewall zone, and wireless SSID.
+  Guest client → other guest wireless Block using AP/client isolation
+  client                              
 
-Important: We are not putting guest devices into the main LAN. Instead, we are allowing narrowly defined connections through the router's firewall. This preserves network separation.
-2. How the firewall will work
-OpenWrt uses firewall zones to control communication between different networks.
+  Authorized guest device → approved  Allow only through a specific rule
+  LAN service                         
 
-We'll create a dedicated guest firewall zone.
+  Return traffic for an allowed       Allowed by connection tracking
+  connection                          
+  -----------------------------------------------------------------------
 
-The zone will have these settings:
-Firewall setting	Value	Purpose
-Input	REJECT	Blocks access to the router
-Output	ACCEPT	Allows router-originated traffic
-Forward	REJECT	Blocks guest-to-other-network traffic
-Masquerading	No	Not needed on the guest zone
-MSS clamping	No	Not needed specifically here
+**Do not add general `guest → lan` forwarding.** Individual traffic
+rules will provide the exceptions.
 
-The forwarding configuration will be:
-Source	Destination	Permission
-Guest	WAN	Allow
-Guest	LAN	Deny by default
-Guest	Guest	Deny client-to-client
-LAN	Guest	Deny new connections by default
+------------------------------------------------------------------------
 
-We will then add individual firewall exceptions for authorized devices.
-The most important security principle
+## 2. Back up your configuration
 
-The guest network should have no general forwarding permission to the LAN.
+Before changing networking:
 
-Instead of allowing all guest devices to access the main network and trying to block individual devices, we deny everything first and create specific exceptions afterward.
+1.  Open LuCI.
+2.  Navigate to **System → Backup / Flash Firmware**.
+3.  Select **Generate archive**.
+4.  Download and safely store the backup.
+5.  Make sure you have a recovery method, preferably wired access, in
+    case a wireless or VLAN change disconnects you.
 
-This is known as a default-deny approach.
+------------------------------------------------------------------------
 
-3. Back up your existing configuration
-Before making network changes, create a backup.
-1. Open your OpenWrt LuCI interface.
-2. Navigate to System → Backup / Flash Firmware.
-3. Find the Backup section.
-4. Select Generate archive.
-5. Download the configuration backup.
-Keep this file somewhere safe.
+## 3. Create the guest interface
 
-Also, make sure you have a way to access the router locally if you accidentally break your wireless configuration.
-4. Create the guest network interface
-We first need to create a separate network interface for guest devices.
-1. Navigate to Network → Interfaces.
-2. Select Add new interface.
-3. Enter the following settings:
-New interface
-Interface nameguest
+1.  Navigate to **Network → Interfaces**.
+2.  Select **Add new interface**.
+3.  Use these settings:
 
-New interface
+  Field          Value
+  -------------- ----------------------------------------------
+  Name           `guest`
+  Protocol       Static address
+  Device         Leave unassigned for a wireless-only network
+  IPv4 address   `192.168.50.1`
+  IPv4 netmask   `255.255.255.0`
+  IPv4 gateway   Leave blank
+  Custom DNS     Leave blank initially
 
+4.  Select **Create interface**.
 
+Do not attach the guest interface to the existing main LAN bridge. A
+wireless-only guest network can attach its wireless access point
+directly to this logical interface.
 
-ProtocolStatic address
+------------------------------------------------------------------------
 
-DeviceLeave unassigned for now
+## 4. Configure DHCP and IPv6
 
-A wireless interface will be attached later. Do not attach the guest network to the existing main LAN bridge.
+### DHCP
 
+Edit the `guest` interface and open the **DHCP Server** tab. Enable DHCP
+and configure:
 
-IPv4 configuration
-Field	Value
-IPv4 address	192.168.50.1
-IPv4 netmask	255.255.255.0
-IPv4 gateway	Leave blank
-Custom DNS	Leave blank
+  Setting      Value
+  ------------ -------
+  Start        `100`
+  Limit        `100`
+  Lease time   `12h`
 
+The resulting DHCP range is:
 
-4. Select Create interface.
-Why use a separate subnet?
-The main LAN uses 192.168.1.0/24, while the guest network uses 192.168.50.0/24.
+-   First address: `192.168.50.100`
+-   Last address: `192.168.50.199`
+-   Router: `192.168.50.1`
 
-This allows OpenWrt to identify which network a device belongs to and apply different firewall policies.
+### IPv6
 
-A guest device receiving 192.168.50.120 will not be considered part of the main LAN.
-5. Configure the guest DHCP server
-DHCP automatically assigns IP addresses to devices joining the guest network.
-1. Open the guest interface's Edit page.
-2. Navigate to the DHCP Server tab.
-3. Enable the DHCP server if it isn't already enabled.
-4. Configure the address pool:
-Setting	Value
-Start	100
-Limit	100
-Lease time	12h
+An IPv4-only policy is not sufficient if guest clients can use IPv6 to
+reach internal networks. Choose one of these approaches:
 
-This gives guests addresses from:
+-   **Simpler approach:** Do not advertise or provide IPv6 on the guest
+    network, and ensure the guest interface is not providing an
+    alternate IPv6 path.
+-   **Advanced approach:** Configure equivalent IPv6 firewall
+    restrictions and explicit exceptions for IPv6 services.
 
-192.168.50.100 through 192.168.50.199
+If using the simpler IPv4-only approach, disable guest-interface Router
+Advertisements and DHCPv6, and do not enable an NDP proxy for the guest
+network. Do not disable IPv6 globally on the router.
 
-The router's guest address remains 192.168.50.1.
-IPv6 considerations
-For this initial configuration, use IPv4-only guest networking unless you also configure equivalent IPv6 firewall restrictions.
+Save the interface settings.
 
-Under the guest interface's IPv6 settings:
-- Router Advertisement: Disabled
-- DHCPv6 service: Disabled
-- NDP proxy: Disabled
-This prevents an unprotected IPv6 path from bypassing an IPv4-only isolation policy.
+------------------------------------------------------------------------
 
-Do not disable IPv6 globally on your router. These settings are specifically for the guest network.
+## 5. Create the guest firewall zone
 
-Save the interface configuration.
-6. Create the guest firewall zone
-Now we need to create the firewall zone that will enforce guest isolation.
-1. Navigate to Network → Firewall.
-2. Open the General Settings tab.
-3. Find the Zones section.
-4. Select Add.
-Configure the new zone:
-Setting	Value
-Name	guest
-Covered networks	guest
-Input	Reject
-Output	Accept
-Forward	Reject
-Masquerading	Disabled
-MSS clamping	Disabled
+1.  Navigate to **Network → Firewall**.
+2.  Open **General Settings**.
+3.  Add a new zone with these settings:
 
-Make sure the guest interface is assigned to this zone.
-Understanding the three policies
-Input: REJECT
+  Setting            Value
+  ------------------ ----------
+  Name               `guest`
+  Covered networks   `guest`
+  Input              Reject
+  Output             Accept
+  Forward            Reject
+  Masquerading       Disabled
+  MSS clamping       Disabled
 
-Input controls traffic destined for the router itself.
+### What the policies mean
 
-This is what prevents guests from accessing router administration services, including:
-- LuCI web interface
-- SSH
-- Router management services
-- Other services listening on the router
-We will create specific exceptions for DHCP and DNS.
+-   **Input: Reject** --- blocks guest-originated traffic to the router
+    itself, except for explicitly allowed traffic rules.
+-   **Output: Accept** --- permits traffic originating from the router.
+-   **Forward: Reject** --- blocks guest traffic being routed to other
+    networks unless a specific exception permits it.
 
-Output: ACCEPT
+### Zone forwarding
 
-Output controls traffic originating from the router.
+Add this forwarding:
 
-This is normally left at ACCEPT.
-
-Forward: REJECT
-
-Forward controls traffic passing through the router to another network.
-
-This blocks guest devices from accessing your main LAN by default.
-Configure zone forwarding
-Find the zone forwarding section.
-
-Add:
-
+``` text
 guest → wan
+```
 
-Do not add:
+Do **not** add:
 
+``` text
 guest → lan
+```
 
-This is extremely important.
+Do not add guest forwarding to IoT or other trusted internal zones
+either. Save the configuration.
 
-The guest network needs permission to reach the internet, but it does not need general permission to reach your main network.
+------------------------------------------------------------------------
 
-Save the configuration.
-7. Allow DHCP and DNS through the firewall
-At this point, the guest network is isolated, but guests still need two services to function properly:
-- DHCP: Assigns IP addresses.
-- DNS: Resolves domain names such as google.com.
-We will allow only these services to communicate with the router.
+## 6. Allow DHCP and DNS to the router
 
-Navigate to Network → Firewall → Traffic Rules.
-Rule 1: Allow guest DHCP
-Select Add and configure:
-Field	Value
-Name	Allow-Guest-DHCP
-Protocol	UDP
-Source zone	guest
-Source port	Any
-Destination zone	Device (input)
-Destination port	67
-Action	Accept
+The guest zone's Input policy is Reject, so explicitly allow only the
+services guests need from the router.
 
-This allows guest devices to request an IP address from the router.
-Rule 2: Allow guest DNS
-Create another traffic rule.
-Field	Value
-Name	Allow-Guest-DNS
-Protocol	TCP + UDP
-Source zone	guest
-Source port	Any
-Destination zone	Device (input)
-Destination port	53
-Action	Accept
+Navigate to **Network → Firewall → Traffic Rules**.
 
-This allows guest devices to use the router's DNS service.
-Expected result
+### Rule A: Guest DHCP
 
-Guests can communicate with the router for DHCP and DNS, but other router services remain blocked.
-Important corrections to the original video:
-- DNS uses port 53, not port 33.
-- DHCP requests use UDP destination port 67.
-- DHCP clients normally use source port 68.
-- DNS should permit both TCP and UDP.
-- Do not change the entire guest zone's Input policy to ACCEPT just to make DHCP and DNS work.
-These exceptions are much safer than opening the router to the entire guest network.
-8. Configure the guest wireless network
-Now we need to create a wireless access point attached to the guest interface.
-1. Navigate to Network → Wireless.
-2. Find the radio you want to use.
-3. Select Add or Add wireless network.
-Configure the access point:
-Wireless configuration
-Setting	Value
-Mode	Access Point
-ESSID	BIGWAKE-GUEST
-Network	guest
-Wireless security	WPA2-PSK or WPA2/WPA3
-Encryption	AES/CCMP
-Key	Your own strong password
-Isolate clients	Enabled
+Create a traffic rule:
 
+  Field              Value
+  ------------------ --------------------
+  Name               `Allow-Guest-DHCP`
+  Protocol           UDP
+  Source zone        `guest`
+  Source port        Any
+  Destination        Device / input
+  Destination port   `67`
+  Action             Accept
 
-Wireless client isolation
-Enable Isolate Clients (sometimes called AP isolation).
+DHCP clients use UDP source port 68 and contact the server on UDP
+destination port 67. The rule should match the server destination port.
 
-This prevents wireless clients connected to the same guest access point from communicating directly with one another.
+### Rule B: Guest DNS
 
-For example:
-- Guest phone A cannot communicate with guest phone B.
-- Guest laptop A cannot directly access guest laptop B.
-This is an additional layer of protection.
+Create another rule:
 
-The firewall zone provides network-level isolation, while wireless client isolation handles communication between clients on the wireless access point itself.
-Configure additional radios
-If you want the guest network available on both 2.4 GHz and 5 GHz:
-1. Create a guest access point on the first radio.
-2. Set its network to guest.
-3. Create another guest access point on the second radio.
-4. Set its network to the same guest interface.
-5. Use the same SSID and security credentials if you want a unified wireless network.
-You do not need to create a separate IP interface for each radio.
+  Field              Value
+  ------------------ -------------------
+  Name               `Allow-Guest-DNS`
+  Protocol           TCP + UDP
+  Source zone        `guest`
+  Source port        Any
+  Destination        Device / input
+  Destination port   `53`
+  Action             Accept
 
-Note for DSA routers: A wireless-only guest network does not require you to create a physical switch VLAN just to separate the SSID. The wireless interface can attach directly to its own logical network interface. If you later want dedicated guest Ethernet ports, you can configure a separate bridge VLAN.
+DNS uses port **53**, not port 33. Both TCP and UDP should be permitted.
 
-Save and apply.
-9. Configure authorized device pass-through
-Important security feature
-This is where we go beyond the original tutorial.
+Do not change the guest zone's Input policy to Accept just to make DHCP
+or DNS work. Keep the default-deny policy and add these narrow
+exceptions.
 
-Normally, the guest network cannot access anything on your main LAN.
+------------------------------------------------------------------------
 
-However, there may be situations where you want a specific guest device to access a specific service on your main network.
+## 7. Create the guest wireless network
 
-For example:
-- A guest laptop needs access to a media server.
-- A guest phone needs access to a particular application server.
-- An authorized computer needs access to a specific service on another LAN.
-We can accomplish this using individual firewall rules.
-9.1 Understand how selective access works
-Imagine the following network:
-Guest network
+1.  Navigate to **Network → Wireless**.
+2.  Select **Add** on the radio you want to use.
+3.  Configure:
 
-192.168.50.0/24
-Authorized laptop
-192.168.50.110
+  Setting           Value
+  ----------------- -------------------------------------
+  Mode              Access Point
+  ESSID             `BIGWAKE-GUEST`
+  Network           `guest`
+  Security          WPA2-PSK or WPA2/WPA3
+  Encryption        AES/CCMP
+  Password          Use a strong, unique guest password
+  Isolate clients   Enabled
 
-Other guest devices
-Blocked
+Enable **Isolate Clients** (also called AP isolation or client
+isolation, depending on the driver and LuCI version). This helps prevent
+wireless clients on the same access point from communicating directly.
 
+### Add the guest SSID to another radio
 
-Specific firewall exception
-TCP port 8096 only
+If you want the guest SSID on both 2.4 GHz and 5 GHz:
 
-Main LAN
+1.  Add a guest access point on the first radio.
+2.  Attach it to the `guest` network.
+3.  Add another guest access point on the second radio.
+4.  Attach it to the same `guest` network.
+5.  Optionally use the same SSID and password on both radios.
 
-192.168.1.0/24
-Media server
-192.168.1.50
+You do not need a separate IP interface for each radio.
 
-Only the specifically permitted service is accessible.
-
-
-In this example:
-- 192.168.50.110 is the authorized guest laptop.
-- 192.168.1.50 is the main LAN media server.
-- TCP port 8096 is the only permitted destination port.
-Other guest devices cannot access that server through this rule.
-
-The authorized laptop also cannot access other ports on that server.
-9.2 Give the authorized guest device a reserved IP address
-First, we need to make sure the authorized device always receives the same IP address.
-1. Navigate to Network → DHCP and DNS.
-2. Find the Static Leases section.
-3. Select Add.
-4. Enter the device's MAC address.
-5. Assign it an IP address.
-Example:
-Setting	Value
-Hostname	authorized-laptop
-MAC address	Device's actual Wi-Fi MAC
-IPv4 address	192.168.50.110
-
-Save the lease.
-
-Reconnect the device to the guest Wi-Fi and verify that it receives the reserved address.
-
-Important: Use the device's private/randomized Wi-Fi MAC consistently. If it changes its MAC address, the reservation and firewall rule may stop matching.
-
-A reserved IP is an identification mechanism for firewall policy, not strong authentication. Someone who can spoof that IP or MAC may be able to impersonate the authorized device. For stronger identity-based access, use a dedicated authenticated VPN or another device-authentication mechanism.
-9.3 Create the selective firewall rule
-Navigate to:
-
-Network → Firewall → Traffic Rules → Add
-
-We will create a rule allowing the authorized laptop to access the media server.
-Example: Allow media server access
-Restricted access
-General settings
-Field	Value
-Name	Guest-Laptop-Media
-Protocol	TCP
-Source zone	guest
-Source address	192.168.50.110
-Destination zone	lan
-Destination address	192.168.1.50
-Destination port	8096
-Action	Accept
-
-
-Advanced settings
-Field	Value
-IP family	IPv4
-Enabled	Yes
-
+A wireless-only guest network does not require a switch VLAN just to
+isolate the SSID. If you later add wired guest ports, see the optional
+VLAN section.
 
 Save and apply.
 
-You have now created a narrowly scoped exception.
+------------------------------------------------------------------------
 
-The firewall still blocks general guest-to-LAN forwarding. This rule allows only matching connections.
-9.4 Allow additional services
-If the authorized laptop needs another service, create another rule for that service.
+## 8. Configure authorized-device pass-through
 
-For example:
-Service	Protocol	Port	Recommendation
-Jellyfin	TCP	8096	Allow if needed
-HTTPS web application	TCP	443	Allow if needed
-SSH	TCP	22	Only when necessary
-SMB file sharing	TCP	445	Avoid unless necessary
-HTTP web application	TCP	80	Only when necessary
+The guest network remains blocked from the main LAN by default. To let
+one approved device reach one approved service, create a narrow traffic
+rule.
 
-Never open all ports simply because one application isn't working.
+### Example network
 
-Also remember that an application may require more than one port or protocol. Only add additional rules after identifying the actual requirements.
-9.5 Allow a device to access more than one LAN
-If your router has multiple trusted network zones, you can repeat this process for each destination.
+  Device                    Address
+  ------------------------- ------------------
+  Authorized guest laptop   `192.168.50.110`
+  Main LAN media server     `192.168.1.50`
+  Example media service     TCP `8096`
 
-For example:
-Source	Destination	Permission
-Authorized guest laptop	Main LAN server	TCP 8096
-Authorized guest laptop	IoT server	TCP 443
-Other guest devices	Main LAN	Blocked
-Other guest devices	IoT LAN	Blocked
+The desired permission is:
 
-For the second rule, choose the actual IoT firewall zone and destination IP address.
+``` text
+192.168.50.110 → 192.168.1.50 TCP/8096
+```
 
-Do not create a general guest-to-IoT or guest-to-LAN forwarding rule.
+All other guest-to-LAN traffic remains blocked.
 
-One important distinction: This is routed access between networks, not literally placing the authorized device on multiple LANs. It keeps the network separation intact.
-9.6 Understand return traffic
-You do not normally need a second firewall rule to allow the server's response.
+### 8.1 Reserve an IP address for the authorized device
 
-OpenWrt tracks connections. Once an authorized connection is accepted, the associated return traffic is allowed automatically.
+1.  Navigate to **Network → DHCP and DNS**.
+2.  Find **Static Leases**.
+3.  Add a lease for the authorized device.
+4.  Use a descriptive hostname, such as `authorized-laptop`.
+5.  Enter the device's Wi-Fi MAC address.
+6.  Assign `192.168.50.110`.
+7.  Save and reconnect the device to guest Wi-Fi.
+8.  Verify that it receives the reserved address.
 
-For example:
-1. The authorized laptop connects to 192.168.1.50:8096.
-2. OpenWrt checks the firewall rule.
-3. The connection is accepted.
-4. The server responds.
-5. OpenWrt recognizes the response as part of the established connection.
-This does not automatically allow the server to initiate a separate new connection to the guest laptop.
+**MAC-address note:** Modern phones and computers may use a private or
+randomized MAC address for each Wi-Fi network. Use the MAC address that
+the device actually presents on this guest SSID. If the address changes,
+the reservation and rule may no longer match.
 
-If an application needs reverse connections, you must evaluate those separately.
-10. Understand how to manage authorized devices
-As you add more devices, it is important to keep track of exactly what each one can access.
+A DHCP reservation is convenient for policy matching, but it is not
+strong authentication. A device capable of spoofing the authorized MAC
+and IP may impersonate it. For stronger identity-based access, use an
+authenticated VPN or another device-authentication mechanism.
 
-I recommend using a simple access-control table.
-Device	Destination	Port	Protocol	Permission
-Guest laptop	Media server	8096	TCP	Allow
-Guest laptop	Web server	443	TCP	Allow
-Guest phone	Media server	8096	TCP	Allow
-Guest phone	Main LAN computers	All	All	Deny
-Unknown guest	Main LAN	All	All	Deny
-Unknown guest	IoT LAN	All	All	Deny
+### 8.2 Create the firewall exception
 
-This makes it much easier to understand which devices have access to your network.
-Recommended naming convention
-Use consistent names for firewall rules.
+Navigate to **Network → Firewall → Traffic Rules → Add**.
 
-Examples:
-- GUEST-LAPTOP-MEDIA
-- GUEST-LAPTOP-WEBSERVER
-- GUEST-PHONE-MEDIA
-- GUEST-ADMIN-SSH
-This makes managing a larger collection of rules much easier.
-Important: Device firewall settings
-OpenWrt is not the only firewall that matters.
+Create this rule:
 
-The destination device may also have its own firewall.
+  Field                 Value
+  --------------------- ----------------------
+  Name                  `GUEST-LAPTOP-MEDIA`
+  Protocol              TCP
+  Source zone           `guest`
+  Source address        `192.168.50.110`
+  Destination zone      `lan`
+  Destination address   `192.168.1.50`
+  Destination port      `8096`
+  IP family             IPv4
+  Action                Accept
+  Enabled               Yes
 
-For example, if your media server runs Debian, its firewall may block connections from 192.168.50.0/24.
+Save and apply.
 
-You may need to permit the guest subnet on the specific application port at the server itself.
+This rule permits only the matching source, destination, protocol, and
+destination port. It does not enable general guest-to-LAN forwarding.
 
-Do not disable the server's firewall to solve this problem. Add an equally narrow exception there.
+### 8.3 Add more services only when needed
 
-11. Optional: Add a separate guest VLAN for wired devices
-Your current design can isolate wireless guest clients without changing your existing LAN switch configuration.
+Create a separate rule for each additional service.
 
-However, if you eventually want to connect physical guest Ethernet devices, you can use a dedicated VLAN.
+  Service                 Protocol     Port Guidance
+  ----------------------- ---------- ------ ------------------------
+  Jellyfin                TCP          8096 Allow if needed
+  HTTPS web application   TCP           443 Allow if needed
+  SSH                     TCP            22 Only when necessary
+  SMB file sharing        TCP           445 Avoid unless necessary
+  HTTP web application    TCP            80 Only when necessary
 
-Since your router uses modern DSA networking, this is configured using bridge VLAN filtering rather than the older swconfig method.
+Do not open all ports because one application is not working. Identify
+the application's actual network requirements first.
 
-An example VLAN plan:
-VLAN ID	Network	Subnet
-1	Main LAN	192.168.1.0/24
-20	IoT	Existing IoT subnet
-50	Guest	192.168.50.0/24
+### 8.4 Allow access to another internal network
 
-The guest VLAN should have:
-- Its own VLAN interface.
-- Its own IP subnet.
-- Its own DHCP service.
-- Its own firewall zone.
-- No general access to the main LAN.
-You would assign the guest VLAN to whichever physical ports should serve guest devices.
-DSA configuration warning
+If the router has a separate IoT or server zone, create another narrow
+rule:
 
-Be careful when editing bridge VLAN settings on an existing router. Incorrect VLAN membership or tagging can disconnect your LAN, including the computer you're using to administer OpenWrt.
+  Field                 Example
+  --------------------- -----------------------------------------
+  Source zone           `guest`
+  Source address        `192.168.50.110`
+  Destination zone      The actual destination zone, e.g. `iot`
+  Destination address   The specific device IP
+  Protocol              Required protocol only
+  Destination port      Required port only
+  Action                Accept
 
-Do not modify the existing main LAN VLAN just to create a wireless-only guest network.
+Do not add general `guest → iot` forwarding.
 
-12. Test the guest network
-Before considering the configuration finished, we need to verify that isolation actually works.
+### 8.5 Return traffic
 
-Connect a phone or laptop to BIGWAKE-GUEST.
-Test 1: Verify the IP address
-Open the device's network settings.
+OpenWrt tracks connections. When the authorized laptop initiates an
+allowed connection, the server's reply traffic is normally allowed as
+part of that established connection.
 
-You should see something similar to:
-Setting	Expected value
-IP address	192.168.50.100–199
-Gateway	192.168.50.1
-DNS	192.168.50.1
-Subnet mask	255.255.255.0
+You generally do not need a second rule for ordinary response traffic. A
+server initiating a new connection back to the guest device is a
+different flow and requires separate consideration.
 
-If the device receives an address from your main LAN, the wireless network is probably attached to the wrong interface.
-Test 2: Verify internet access
-Open a browser and visit:
-- https://google.com
-- https://cloudflare.com
-Both should load.
+------------------------------------------------------------------------
 
-You can also test DNS using:
+## 9. Manage multiple authorized devices and services
+
+Keep a record of each exception so it is clear which device can access
+which service.
+
+### Example access-control table
+
+  Source device   Destination          Protocol     Port Permission
+  --------------- -------------------- ---------- ------ ------------
+  Guest laptop    Media server         TCP          8096 Allow
+  Guest laptop    Web server           TCP           443 Allow
+  Guest phone     Media server         TCP          8096 Allow
+  Guest phone     Main LAN computers   Any           Any Deny
+  Unknown guest   Main LAN             Any           Any Deny
+  Unknown guest   IoT LAN              Any           Any Deny
+
+### Recommended rule naming
+
+Use consistent names:
+
+-   `GUEST-LAPTOP-MEDIA`
+-   `GUEST-LAPTOP-WEBSERVER`
+-   `GUEST-PHONE-MEDIA`
+-   `GUEST-ADMIN-SSH`
+
+### Remember destination-device firewalls
+
+The destination server may have its own firewall. For example, a Debian
+media server may block connections from `192.168.50.0/24`.
+
+If necessary, add a narrow server-side rule allowing the guest subnet to
+reach only the required application port. Do not disable the server
+firewall.
+
+------------------------------------------------------------------------
+
+## 10. Optional: Guest VLAN for wired devices
+
+A wireless-only guest network can be isolated without changing the
+existing switch VLAN configuration.
+
+If you want physical Ethernet ports for guest devices, use a separate
+VLAN. On modern OpenWrt DSA devices, VLANs are configured through bridge
+VLAN filtering rather than legacy `swconfig`.
+
+Example plan:
+
+    VLAN ID Network    Subnet
+  --------- ---------- --------------------------
+          1 Main LAN   `192.168.1.0/24`
+         20 IoT        Your existing IoT subnet
+         50 Guest      `192.168.50.0/24`
+
+The guest VLAN needs its own:
+
+-   VLAN interface
+-   IP subnet
+-   DHCP service
+-   Firewall zone
+-   Wireless or wired port membership, as applicable
+
+**Warning:** Incorrect bridge VLAN tagging or membership can disconnect
+your LAN and lock you out of LuCI. Do not modify the existing main LAN
+VLAN just to create a wireless-only guest SSID. Make VLAN changes only
+after confirming the router's DSA port layout and having a recovery
+path.
+
+------------------------------------------------------------------------
+
+## 11. Test the configuration
+
+Connect a phone or laptop to `BIGWAKE-GUEST`.
+
+### Test 1: Check the assigned IP address
+
+Expected values:
+
+  Setting       Expected value
+  ------------- ------------------------------------
+  IP address    `192.168.50.100`--`192.168.50.199`
+  Gateway       `192.168.50.1`
+  DNS           `192.168.50.1`
+  Subnet mask   `255.255.255.0`
+
+If the device receives an address from the main LAN, check which logical
+network the wireless access point is attached to.
+
+### Test 2: Check internet and DNS
+
+Open:
+
+-   <https://google.com>
+-   <https://cloudflare.com>
+
+Then run:
+
+``` bash
 nslookup google.com
+```
 
+The websites should load and DNS should resolve.
 
-Test 3: Verify router administration is blocked
+### Test 3: Check router administration isolation
+
 Try opening:
+
+``` text
 http://192.168.50.1
-
-
-Then try:
 http://192.168.1.1
-
+```
 
 Also test SSH:
+
+``` bash
 ssh root@192.168.50.1
+```
 
+Router administration should be blocked from guest clients. DHCP and DNS
+should continue working.
 
-These connections should be rejected or time out.
+### Test 4: Check main LAN isolation
 
-DHCP and DNS should still work.
-Test 4: Verify main LAN isolation
-Try accessing a known main LAN device.
+Try:
 
-For example:
+``` bash
 ping 192.168.1.209
-
+```
 
 Then test a known service:
+
+``` bash
 curl http://192.168.1.209:80
+```
 
+These should fail unless that exact connection has been authorized.
 
-Neither should be accessible unless you have explicitly authorized that device and service.
+A failed ping alone does not prove isolation because a destination
+device may block ICMP. Test actual services too.
 
-A failed ping alone does not prove isolation because some devices block ICMP. Test actual services too.
-Test 5: Verify guest client isolation
-Connect two devices to the guest Wi-Fi.
+### Test 5: Check guest client isolation
 
-Try accessing one device from the other.
+Connect two devices to the guest Wi-Fi and try to communicate between
+them. They should not be able to communicate directly when AP/client
+isolation is supported and enabled.
 
-They should not be able to communicate directly.
-Test 6: Verify authorized pass-through
-Use the authorized laptop from our earlier example.
+### Test 6: Check authorized pass-through
 
-Run:
+From the authorized laptop:
+
+``` bash
 curl http://192.168.1.50:8096
+```
 
+This should reach the example media service.
 
-This should reach the media server.
+Try an unapproved port:
 
-Now try another port:
+``` bash
 curl http://192.168.1.50:80
+```
 
+It should be blocked unless separately authorized.
 
-If port 80 has not been authorized, it should be blocked.
-
-Finally, connect an unauthorized guest device and repeat the media server test.
-
+Finally, repeat the media-server test from an unauthorized guest device.
 It should be blocked.
-Expected security test results
-Test	Expected result
-Internet access	Allowed
-DHCP	Allowed
-DNS	Allowed
-Guest → Router management	Blocked
-Guest → Main LAN	Blocked
-Guest → IoT LAN	Blocked
-Guest → Other guests	Blocked
-Authorized device → Approved port	Allowed
-Authorized device → Other ports	Blocked
-Unauthorized device → Approved port	Blocked
 
+### Expected results
 
+  Test                                     Expected result
+  ---------------------------------------- --------------------
+  Internet access                          Allowed
+  DHCP                                     Allowed
+  DNS                                      Allowed
+  Guest → router management                Blocked
+  Guest → main LAN                         Blocked by default
+  Guest → IoT LAN                          Blocked by default
+  Guest → other wireless clients           Blocked
+  Authorized device → approved service     Allowed
+  Authorized device → unapproved port      Blocked
+  Unauthorized device → approved service   Blocked
 
-13. Troubleshooting
-Problem	Possible cause	Solution
-Guest Wi-Fi has no internet	Missing guest-to-WAN forwarding	Check firewall zone forwarding
-Guest doesn't receive an IP	DHCP not enabled or DHCP rule missing	Check guest DHCP settings and UDP 67 rule
-DNS doesn't work	DNS input rule missing	Check TCP/UDP 53
-Guest can access LuCI	Input policy or another firewall exception allows it	Inspect guest zone and traffic rules
-Guest can access main LAN	Broad forwarding or an overly broad allow rule	Remove guest-to-LAN forwarding and inspect exceptions
-Authorized device cannot access server	Incorrect IP, port, protocol or destination zone	Check the reservation and firewall rule
-Authorized device works on one port but not another	Only one port was allowed	Add a separate rule if the second service is needed
-IPv6 bypasses isolation	IPv6 firewall or RA configuration is incomplete	Disable guest IPv6 or configure equivalent restrictions
+------------------------------------------------------------------------
 
-If something doesn't work, inspect the firewall configuration before adding broad permissions.
+## 12. Troubleshooting
 
-You can also check your current firewall configuration through SSH:
+  -----------------------------------------------------------------------
+  Problem                 Possible cause          What to check
+  ----------------------- ----------------------- -----------------------
+  Guest Wi-Fi has no      Missing guest-to-WAN    Guest zone forwarding
+  internet                forwarding              
+
+  Guest receives no IP    DHCP disabled or DHCP   Guest DHCP settings and
+  address                 rule missing            UDP destination port 67
+
+  DNS does not work       DNS input rule missing  TCP/UDP destination
+                          or incorrect            port 53
+
+  Guest can access LuCI   Input policy or another Guest zone and all
+                          rule permits access     applicable traffic
+                                                  rules
+
+  Guest can access main   Broad forwarding or     Remove guest-to-LAN
+  LAN                     overly broad allow rule forwarding and inspect
+                                                  exceptions
+
+  Guest can access IoT    Broad guest-to-IoT      Remove broad forwarding
+                          forwarding              and inspect exceptions
+
+  Authorized device       Wrong source IP,        DHCP reservation and
+  cannot reach server     destination IP, zone,   traffic rule
+                          protocol, or port       
+
+  One application works   Only one service port   Identify and authorize
+  but another does not    was permitted           the additional required
+                                                  port
+
+  IPv6 bypasses isolation IPv6 firewall or        Guest IPv6
+                          advertisements are not  configuration and
+                          restricted              firewall rules
+  -----------------------------------------------------------------------
+
+Useful diagnostic commands over SSH:
+
+Show UCI firewall configuration:
+
+``` bash
 uci show firewall
+```
 
+Inspect the active nftables ruleset:
 
-And inspect active firewall rules:
+``` bash
 nft list ruleset
+```
 
+These commands are useful for diagnosing firewall4 behavior. Review the
+active rules before adding broad permissions to work around a problem.
 
-These commands are useful for diagnosing problems with firewall4.
-14. Final security checklist
-Before putting the network into use, make sure everything below is configured.
+------------------------------------------------------------------------
 
+## 13. Final security checklist
 
-- Guest network uses a separate subnet (192.168.50.0/24).
-- Guest interface has its own DHCP server.
-- Guest IPv6 is disabled or separately protected.
-- Guest firewall zone has Input: REJECT.
-- Guest firewall zone has Output: ACCEPT.
-- Guest firewall zone has Forward: REJECT.
-- Guest-to-WAN forwarding is enabled.
-- Guest-to-LAN forwarding is NOT enabled.
-- Guest-to-IoT forwarding is NOT enabled.
-- Only DHCP and DNS are allowed to the router.
-- Guest wireless client isolation is enabled.
-- Guest Wi-Fi uses WPA2 or WPA3 security.
-- Authorized devices have reserved IP addresses.
-- Pass-through rules specify source device, destination device, protocol and port.
-- Destination devices have appropriate local firewall rules.
-- Internet, isolation and authorized access tests have passed.
-Reset checklist
-15. Official documentation
-These are useful references for understanding and maintaining the configuration:
-- OpenWrt Network Configuration — Interfaces, bridges and DSA networking.
-- OpenWrt Firewall Configuration — Firewall zones, forwarding and traffic rules.
-- OpenWrt DHCP and DNS Configuration — DHCP leases and DNS configuration.
+-   [ ] Guest network uses a separate subnet (`192.168.50.0/24`).
+-   [ ] Guest interface has its own DHCP server.
+-   [ ] Guest IPv6 is disabled or separately protected.
+-   [ ] Guest firewall zone has Input: Reject.
+-   [ ] Guest firewall zone has Output: Accept.
+-   [ ] Guest firewall zone has Forward: Reject.
+-   [ ] Guest-to-WAN forwarding is enabled.
+-   [ ] Guest-to-LAN forwarding is not enabled.
+-   [ ] Guest-to-IoT forwarding is not enabled.
+-   [ ] Only DHCP and DNS are allowed to the router.
+-   [ ] Guest wireless client isolation is enabled.
+-   [ ] Guest Wi-Fi uses WPA2 or WPA3 security.
+-   [ ] Authorized devices have reserved IP addresses.
+-   [ ] Pass-through rules specify source device, destination device,
+    protocol, and port.
+-   [ ] Destination devices have appropriate local firewall rules.
+-   [ ] Internet, isolation, and authorized-access tests have passed.
 
-Final result
-You now have a guest network with three distinct levels of protection:
-1. Network isolation: Guest devices cannot freely communicate with your trusted networks or router.
-2. Client isolation: Guest devices cannot directly communicate with other guest wireless clients.
-3. Selective access: Individual devices can be granted access to specific servers and ports without opening the entire main network.
-The most important part is that you never need to trust the entire guest network just because one device needs access to one service.
+------------------------------------------------------------------------
 
-Default deny, explicit authorization, and minimum necessary access. That's the security model this configuration is designed around.
+## Official documentation
+
+-   [OpenWrt Network
+    Configuration](https://openwrt.org/docs/guide-user/network/network_configuration)
+    --- interfaces, bridges, and network configuration.
+-   [OpenWrt Firewall
+    Configuration](https://openwrt.org/docs/guide-user/firewall/firewall_configuration)
+    --- firewall zones, forwarding, and traffic rules.
+-   [OpenWrt DHCP and DNS
+    Configuration](https://openwrt.org/docs/guide-user/base-system/dhcp)
+    --- DHCP leases and DNS.
+-   [OpenWrt Guest Wi-Fi
+    Guide](https://openwrt.org/docs/guide-user/network/wifi/guestwifi/guest-wlan)
+    --- guest wireless networking.
+
+------------------------------------------------------------------------
+
+## Final result
+
+The resulting network has three layers of protection:
+
+1.  **Network isolation:** Guest devices cannot freely communicate with
+    the router or trusted networks.
+2.  **Client isolation:** Guest wireless clients cannot directly
+    communicate with other guest wireless clients, where supported by
+    the access point and driver.
+3.  **Selective access:** Individual devices can reach only explicitly
+    approved servers and ports.
+
+The guest network remains untrusted. A device does not gain broad LAN
+access just because it needs one application.
+
+**Default deny. Explicit authorization. Minimum necessary access.**
+
